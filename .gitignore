@@ -1,0 +1,63 @@
+# AI assistant files
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+/agents/
+AGENTS.md
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs and temp files
+*.log
+logs/
+tmp/
+
+# Go (worker)
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+/worker/bin/
+vendor/
+
+# Node (client / server)
+node_modules/
+dist/
+build/
+.next/
+.turbo/
+.cache/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Terraform (infra)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+crash.log
