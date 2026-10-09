@@ -8,6 +8,7 @@ AGENTS.md
 # Secrets and local environment
 .env
 .env.*
+*.env
 !.env.example
 *.pem
 *.key
