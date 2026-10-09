@@ -43,7 +43,7 @@ func TestExtractAudio(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := filepath.Join(outDir, "audio.m4a"); got != want {
+			if want := filepath.Join(outDir, "audio.mp3"); got != want {
 				t.Errorf("path = %q, want %q", got, want)
 			}
 
@@ -63,8 +63,8 @@ func TestExtractAudio(t *testing.T) {
 			if err := json.Unmarshal([]byte(out), &probe); err != nil {
 				t.Fatal(err)
 			}
-			if len(probe.Streams) != 1 || probe.Streams[0].CodecType != "audio" || probe.Streams[0].CodecName != "aac" {
-				t.Errorf("streams = %+v, want one aac audio stream", probe.Streams)
+			if len(probe.Streams) != 1 || probe.Streams[0].CodecType != "audio" || probe.Streams[0].CodecName != "mp3" {
+				t.Errorf("streams = %+v, want one mp3 audio stream", probe.Streams)
 			}
 			if d, _ := strconv.ParseFloat(probe.Format.Duration, 64); d < 1.9 || d > 2.2 {
 				t.Errorf("duration = %s, want about 2 seconds", probe.Format.Duration)
