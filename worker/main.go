@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/lavale1012/ss-go-wrkr/awsclient"
-	"github.com/lavale1012/ss-go-wrkr/server"
 )
 
 const awsInitTimeout = 10 * time.Second
@@ -19,7 +18,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if err := server.Run(); err != nil {
-		log.Fatal(err)
-	}
+	// The job loop (consume SQS, run FFmpeg) is not written yet. The HTTP API
+	// lives in ../server.
 }
