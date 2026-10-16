@@ -9,12 +9,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
 	"github.com/lavale1012/ss-go-wrkr/awsclient"
 	"github.com/lavale1012/ss-go-wrkr/consumer"
 	"github.com/lavale1012/ss-go-wrkr/job"
+	"github.com/lavale1012/ss-go-wrkr/jobstate"
 	"github.com/lavale1012/ss-go-wrkr/media"
 )
 
@@ -36,6 +38,10 @@ func run() error {
 	if outputBucket == "" {
 		return errors.New("OUTPUT_BUCKET is not set")
 	}
+	jobsTable := os.Getenv("JOBS_TABLE")
+	if jobsTable == "" {
+		return errors.New("JOBS_TABLE is not set")
+	}
 	if err := media.CheckTools(); err != nil {
 		return err
 	}
@@ -48,16 +54,18 @@ func run() error {
 	}
 
 	// SIGTERM is what Kubernetes sends on scale-down. The first signal stops
-	// polling and lets the current message finish; handling is then restored
-	// to the default so a second signal exits immediately.
+	// polling, stops the current job and releases its message to another
+	// worker; handling is then restored to the default so a second signal
+	// exits immediately.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	context.AfterFunc(ctx, stop)
 
 	cfg := awsclient.Config()
-	jobs := job.NewHandler(s3.NewFromConfig(cfg), outputBucket, process)
+	store := jobstate.New(dynamodb.NewFromConfig(cfg), jobsTable)
+	jobs := job.NewHandler(s3.NewFromConfig(cfg), store, outputBucket, process)
 
-	slog.Info("worker started", "queue_url", queueURL, "output_bucket", outputBucket)
+	slog.Info("worker started", "queue_url", queueURL, "output_bucket", outputBucket, "jobs_table", jobsTable)
 	consumer.New(sqs.NewFromConfig(cfg), queueURL, jobs.Handle).Run(ctx)
 	slog.Info("worker stopped")
 	return nil

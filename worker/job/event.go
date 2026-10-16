@@ -8,6 +8,16 @@ import (
 	"strings"
 )
 
+// jobID returns the job ID in an upload key. The API's presigned uploads use
+// the layout uploads/<job id>/<file>, and the worker relies on it.
+func jobID(key string) (string, error) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 3 || parts[0] != "uploads" || parts[1] == "" || parts[2] == "" {
+		return "", fmt.Errorf("key %q is not uploads/<job id>/<file>", key)
+	}
+	return parts[1], nil
+}
+
 // source is one uploaded video named by a queue message.
 type source struct {
 	Bucket string

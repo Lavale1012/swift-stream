@@ -3,9 +3,11 @@ package job
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -69,13 +71,8 @@ func TestParseEvent(t *testing.T) {
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
-			if len(got) != len(tt.want) {
-				t.Fatalf("got %v, want %v", got, tt.want)
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("source %d = %v, want %v", i, got[i], tt.want[i])
-				}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -84,7 +81,6 @@ func TestParseEvent(t *testing.T) {
 // fakeS3 serves one object body and records what is uploaded.
 type fakeS3 struct {
 	body   io.Reader
-	length *int64
 	getErr error
 	putErr error
 	gets   []*s3.GetObjectInput
@@ -99,7 +95,7 @@ func (f *fakeS3) GetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
-	return &s3.GetObjectOutput{Body: io.NopCloser(f.body), ContentLength: f.length}, nil
+	return &s3.GetObjectOutput{Body: io.NopCloser(f.body)}, nil
 }
 
 func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -127,7 +123,41 @@ func (r *failingReader) Read(p []byte) (int, error) {
 }
 
 func message(body string) types.Message {
-	return types.Message{MessageId: aws.String("m1"), Body: aws.String(body)}
+	return types.Message{
+		MessageId:  aws.String("m1"),
+		Body:       aws.String(body),
+		Attributes: map[string]string{"ApproximateReceiveCount": "2"},
+	}
+}
+
+// fakeStore records the job state calls it receives.
+type fakeStore struct {
+	done        bool
+	startErr    error
+	completeErr error
+
+	calls      []string // "start", "complete" or "fail", in order
+	started    string
+	completed  string
+	failReason string
+}
+
+func (f *fakeStore) Start(_ context.Context, jobID, bucket, key string, attempt int) (bool, error) {
+	f.calls = append(f.calls, "start")
+	f.started = fmt.Sprintf("%s s3://%s/%s attempt %d", jobID, bucket, key, attempt)
+	return f.done, f.startErr
+}
+
+func (f *fakeStore) Complete(_ context.Context, jobID, bucket, key string) error {
+	f.calls = append(f.calls, "complete")
+	f.completed = fmt.Sprintf("%s s3://%s/%s", jobID, bucket, key)
+	return f.completeErr
+}
+
+func (f *fakeStore) Fail(_ context.Context, jobID, reason string) error {
+	f.calls = append(f.calls, "fail")
+	f.failReason = jobID + ": " + reason
+	return nil
 }
 
 // writeAudio is a ProcessFunc that stands in for FFmpeg.
@@ -139,14 +169,21 @@ func writeAudio(_ context.Context, _, outDir string) (Output, error) {
 	return Output{Path: out, ContentType: "audio/mpeg"}, nil
 }
 
+// video returns an S3 fake that serves a small source video. Each call needs
+// its own, because a reader is used up after one download.
+func video() *fakeS3 {
+	return &fakeS3{body: strings.NewReader("video bytes")}
+}
+
 func TestHandleDownloadsProcessesAndUploads(t *testing.T) {
 	// Point os.MkdirTemp at a directory the test can inspect afterwards.
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
 
-	client := &fakeS3{body: strings.NewReader("video bytes"), length: aws.Int64(11)}
+	client := video()
+	store := &fakeStore{}
 	var gotPath, gotContent string
-	h := NewHandler(client, "processed", func(ctx context.Context, sourcePath, outDir string) (Output, error) {
+	h := NewHandler(client, store, "processed", func(ctx context.Context, sourcePath, outDir string) (Output, error) {
 		gotPath = sourcePath
 		data, err := os.ReadFile(sourcePath)
 		if err != nil {
@@ -190,64 +227,123 @@ func TestHandleDownloadsProcessesAndUploads(t *testing.T) {
 	if client.putBodies[0] != "audio bytes" {
 		t.Errorf("uploaded %q, want the processed file", client.putBodies[0])
 	}
+
+	if !slices.Equal(store.calls, []string{"start", "complete"}) {
+		t.Errorf("store calls = %v, want start then complete", store.calls)
+	}
+	if want := "abc s3://raw/uploads/abc/source.mov attempt 2"; store.started != want {
+		t.Errorf("started %q, want %q", store.started, want)
+	}
+	if want := "abc s3://processed/uploads/abc/audio.mp3"; store.completed != want {
+		t.Errorf("completed %q, want %q", store.completed, want)
+	}
 	assertEmpty(t, tmp)
+}
+
+func TestHandleSkipsCompletedJob(t *testing.T) {
+	client := video()
+	store := &fakeStore{done: true}
+	h := NewHandler(client, store, "processed", func(context.Context, string, string) (Output, error) {
+		t.Error("process called for a job that already completed")
+		return Output{}, nil
+	})
+
+	err := h.Handle(context.Background(), message(eventBody("ObjectCreated:Put", "raw", "uploads/abc/source.mp4")))
+	if err != nil {
+		t.Errorf("err = %v, want nil so the redelivered message is deleted", err)
+	}
+	if len(client.gets) != 0 || len(client.puts) != 0 {
+		t.Errorf("S3 calls: %d gets, %d puts; want none", len(client.gets), len(client.puts))
+	}
+	if !slices.Equal(store.calls, []string{"start"}) {
+		t.Errorf("store calls = %v, want only start", store.calls)
+	}
 }
 
 func TestHandleFailures(t *testing.T) {
 	processErr := errors.New("ffmpeg exited 1")
 	getErr := errors.New("NoSuchKey")
 	putErr := errors.New("AccessDenied")
+	startErr := errors.New("dynamodb unavailable")
+	completeErr := errors.New("dynamodb throttled")
+	upload := eventBody("ObjectCreated:Put", "raw", "uploads/abc/source.mp4")
+	failingUpload := video()
+	failingUpload.putErr = putErr
 	tests := []struct {
 		name        string
 		client      *fakeS3
+		store       *fakeStore
 		body        string
 		processErr  error
 		wantErr     error
 		wantGet     bool
 		wantProcess bool
 		wantPut     bool
+		wantCalls   []string
 	}{
 		{
-			name:    "s3 download error",
-			client:  &fakeS3{getErr: getErr},
-			body:    eventBody("ObjectCreated:Put", "raw", "a.mp4"),
-			wantErr: getErr,
-			wantGet: true,
+			name:      "s3 download error",
+			client:    &fakeS3{getErr: getErr},
+			body:      upload,
+			wantErr:   getErr,
+			wantGet:   true,
+			wantCalls: []string{"start", "fail"},
 		},
 		{
-			name:    "download cut off",
-			client:  &fakeS3{body: &failingReader{}},
-			body:    eventBody("ObjectCreated:Put", "raw", "a.mp4"),
-			wantGet: true,
-		},
-		{
-			name:    "fewer bytes than the object size",
-			client:  &fakeS3{body: strings.NewReader("short"), length: aws.Int64(11)},
-			body:    eventBody("ObjectCreated:Put", "raw", "a.mp4"),
-			wantGet: true,
+			name:      "download cut off",
+			client:    &fakeS3{body: &failingReader{}},
+			body:      upload,
+			wantGet:   true,
+			wantCalls: []string{"start", "fail"},
 		},
 		{
 			name:        "process error",
-			client:      &fakeS3{body: strings.NewReader("video bytes"), length: aws.Int64(11)},
-			body:        eventBody("ObjectCreated:Put", "raw", "a.mp4"),
+			client:      video(),
+			body:        upload,
 			processErr:  processErr,
 			wantErr:     processErr,
 			wantGet:     true,
 			wantProcess: true,
+			wantCalls:   []string{"start", "fail"},
 		},
 		{
 			name:        "s3 upload error",
-			client:      &fakeS3{body: strings.NewReader("video bytes"), length: aws.Int64(11), putErr: putErr},
-			body:        eventBody("ObjectCreated:Put", "raw", "a.mp4"),
+			client:      failingUpload,
+			body:        upload,
 			wantErr:     putErr,
 			wantGet:     true,
 			wantProcess: true,
 			wantPut:     true,
+			wantCalls:   []string{"start", "fail"},
+		},
+		{
+			name:      "job state cannot be written",
+			client:    video(),
+			store:     &fakeStore{startErr: startErr},
+			body:      upload,
+			wantErr:   startErr,
+			wantCalls: []string{"start"},
+		},
+		{
+			name:        "completion cannot be recorded",
+			client:      video(),
+			store:       &fakeStore{completeErr: completeErr},
+			body:        upload,
+			wantErr:     completeErr,
+			wantGet:     true,
+			wantProcess: true,
+			wantPut:     true,
+			wantCalls:   []string{"start", "complete"},
 		},
 		{
 			name:   "source is in the output bucket",
-			client: &fakeS3{body: strings.NewReader("video bytes"), length: aws.Int64(11)},
+			client: &fakeS3{},
 			body:   eventBody("ObjectCreated:Put", "processed", "uploads/abc/audio.mp3"),
+		},
+		{
+			name:   "key is not an upload",
+			client: &fakeS3{},
+			body:   eventBody("ObjectCreated:Put", "raw", "a.mp4"),
 		},
 		{
 			name:   "unreadable message",
@@ -260,8 +356,12 @@ func TestHandleFailures(t *testing.T) {
 			tmp := t.TempDir()
 			t.Setenv("TMPDIR", tmp)
 
+			store := tt.store
+			if store == nil {
+				store = &fakeStore{}
+			}
 			processed := false
-			h := NewHandler(tt.client, "processed", func(ctx context.Context, sourcePath, outDir string) (Output, error) {
+			h := NewHandler(tt.client, store, "processed", func(ctx context.Context, sourcePath, outDir string) (Output, error) {
 				processed = true
 				if tt.processErr != nil {
 					return Output{}, tt.processErr
@@ -285,14 +385,39 @@ func TestHandleFailures(t *testing.T) {
 			if got := len(tt.client.puts) > 0; got != tt.wantPut {
 				t.Errorf("uploaded = %v, want %v", got, tt.wantPut)
 			}
+			if !slices.Equal(store.calls, tt.wantCalls) {
+				t.Errorf("store calls = %v, want %v", store.calls, tt.wantCalls)
+			}
+			if slices.Contains(tt.wantCalls, "fail") && !strings.HasPrefix(store.failReason, "abc: ") {
+				t.Errorf("failure recorded as %q, want it on job abc", store.failReason)
+			}
 			assertEmpty(t, tmp)
 		})
 	}
 }
 
+// TestHandleShutdownIsNotAFailure stops the job mid-way, as a SIGTERM would.
+func TestHandleShutdownIsNotAFailure(t *testing.T) {
+	store := &fakeStore{}
+	ctx, cancel := context.WithCancel(context.Background())
+	h := NewHandler(video(), store, "processed", func(ctx context.Context, _, _ string) (Output, error) {
+		cancel()
+		return Output{}, ctx.Err()
+	})
+
+	err := h.Handle(ctx, message(eventBody("ObjectCreated:Put", "raw", "uploads/abc/source.mp4")))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled", err)
+	}
+	if !slices.Equal(store.calls, []string{"start"}) {
+		t.Errorf("store calls = %v, want no failure recorded", store.calls)
+	}
+}
+
 func TestHandleIgnoresMessageWithNoUpload(t *testing.T) {
 	client := &fakeS3{}
-	h := NewHandler(client, "processed", func(context.Context, string, string) (Output, error) {
+	store := &fakeStore{}
+	h := NewHandler(client, store, "processed", func(context.Context, string, string) (Output, error) {
 		t.Error("process called for a message with no upload")
 		return Output{}, nil
 	})
@@ -301,8 +426,29 @@ func TestHandleIgnoresMessageWithNoUpload(t *testing.T) {
 	if err != nil {
 		t.Errorf("err = %v, want nil so the message is deleted", err)
 	}
-	if len(client.gets) != 0 || len(client.puts) != 0 {
-		t.Errorf("S3 calls: %d gets, %d puts; want none", len(client.gets), len(client.puts))
+	if len(client.gets) != 0 || len(client.puts) != 0 || len(store.calls) != 0 {
+		t.Errorf("calls: %d gets, %d puts, store %v; want none", len(client.gets), len(client.puts), store.calls)
+	}
+}
+
+func TestJobID(t *testing.T) {
+	tests := []struct {
+		key     string
+		want    string
+		wantErr bool
+	}{
+		{key: "uploads/abc/source.mp4", want: "abc"},
+		{key: "a.mp4", wantErr: true},
+		{key: "uploads/source.mp4", wantErr: true},
+		{key: "uploads//source.mp4", wantErr: true},
+		{key: "other/abc/source.mp4", wantErr: true},
+		{key: "uploads/abc/nested/source.mp4", wantErr: true},
+	}
+	for _, tt := range tests {
+		got, err := jobID(tt.key)
+		if (err != nil) != tt.wantErr || got != tt.want {
+			t.Errorf("jobID(%q) = %q, %v; want %q, error %v", tt.key, got, err, tt.want, tt.wantErr)
+		}
 	}
 }
 
