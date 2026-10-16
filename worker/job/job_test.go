@@ -431,7 +431,7 @@ func TestHandleIgnoresMessageWithNoUpload(t *testing.T) {
 	}
 }
 
-func TestJobID(t *testing.T) {
+func TestParseJobID(t *testing.T) {
 	tests := []struct {
 		key     string
 		want    string
@@ -445,9 +445,9 @@ func TestJobID(t *testing.T) {
 		{key: "uploads/abc/nested/source.mp4", wantErr: true},
 	}
 	for _, tt := range tests {
-		got, err := jobID(tt.key)
+		got, err := parseJobID(tt.key)
 		if (err != nil) != tt.wantErr || got != tt.want {
-			t.Errorf("jobID(%q) = %q, %v; want %q, error %v", tt.key, got, err, tt.want, tt.wantErr)
+			t.Errorf("parseJobID(%q) = %q, %v; want %q, error %v", tt.key, got, err, tt.want, tt.wantErr)
 		}
 	}
 }

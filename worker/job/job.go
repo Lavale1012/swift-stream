@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -93,7 +94,7 @@ func (h *Handler) run(ctx context.Context, src source, attempt int) error {
 	if src.Bucket == h.outputBucket {
 		return errors.New("source bucket is also the output bucket, refusing to process")
 	}
-	jobID, err := jobID(src.Key)
+	jobID, err := parseJobID(src.Key)
 	if err != nil {
 		return err
 	}
@@ -127,6 +128,16 @@ func (h *Handler) run(ctx context.Context, src source, attempt int) error {
 	log.InfoContext(ctx, "processing complete", "stage", "upload",
 		"output_bucket", h.outputBucket, "output_key", outputKey)
 	return nil
+}
+
+// parseJobID returns the job ID in an upload key. The API's presigned uploads use
+// the layout uploads/<job id>/<file>, and the worker relies on it.
+func parseJobID(key string) (string, error) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 3 || parts[0] != "uploads" || parts[1] == "" || parts[2] == "" {
+		return "", fmt.Errorf("key %q is not uploads/<job id>/<file>", key)
+	}
+	return parts[1], nil
 }
 
 // work downloads the source, processes it, uploads the result, and returns
