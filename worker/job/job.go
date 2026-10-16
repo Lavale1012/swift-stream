@@ -57,11 +57,14 @@ type Handler struct {
 	s3           S3
 	store        Store
 	outputBucket string
+	workDir      string
 	process      ProcessFunc
 }
 
-func NewHandler(client S3, store Store, outputBucket string, process ProcessFunc) *Handler {
-	return &Handler{s3: client, store: store, outputBucket: outputBucket, process: process}
+// NewHandler returns a Handler that puts each job's files in a new directory
+// under workDir.
+func NewHandler(client S3, store Store, outputBucket, workDir string, process ProcessFunc) *Handler {
+	return &Handler{s3: client, store: store, outputBucket: outputBucket, workDir: workDir, process: process}
 }
 
 // Handle processes one queue message whose body is an S3 event notification.
@@ -143,8 +146,9 @@ func parseJobID(key string) (string, error) {
 // work downloads the source, processes it, uploads the result, and returns
 // the result's key in the output bucket.
 func (h *Handler) work(ctx context.Context, log *slog.Logger, src source) (string, error) {
-	// Each job gets its own directory, removed however the job ends.
-	dir, err := os.MkdirTemp("", "job-")
+	// Each job gets its own directory, removed however the job ends. If the
+	// process dies first, the next worker to start removes it (see workdir).
+	dir, err := os.MkdirTemp(h.workDir, "job-")
 	if err != nil {
 		return "", fmt.Errorf("create job directory: %w", err)
 	}

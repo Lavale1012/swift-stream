@@ -4,6 +4,7 @@ package consumer
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -41,20 +42,26 @@ type Handler func(ctx context.Context, msg types.Message) error
 
 // Consumer polls one queue and runs a Handler for each message, one at a time.
 type Consumer struct {
-	client    SQS
-	queueURL  string
-	handle    Handler
-	backoff   time.Duration
-	heartbeat time.Duration
+	client      SQS
+	queueURL    string
+	handle      Handler
+	maxAttempts int
+	backoff     time.Duration
+	heartbeat   time.Duration
 }
 
-func New(client SQS, queueURL string, handle Handler) *Consumer {
+// New returns a Consumer that deletes a message once it has failed on its
+// maxAttempts-th delivery, so a message that can never succeed stops being
+// retried. A dead-letter queue does this job better; when the queue has one,
+// keep its maxReceiveCount below maxAttempts so SQS moves the message first.
+func New(client SQS, queueURL string, handle Handler, maxAttempts int) *Consumer {
 	return &Consumer{
-		client:    client,
-		queueURL:  queueURL,
-		handle:    handle,
-		backoff:   defaultBackoff,
-		heartbeat: defaultHeartbeat,
+		client:      client,
+		queueURL:    queueURL,
+		handle:      handle,
+		maxAttempts: maxAttempts,
+		backoff:     defaultBackoff,
+		heartbeat:   defaultHeartbeat,
 	}
 }
 
@@ -104,10 +111,9 @@ func (c *Consumer) receive(ctx context.Context) ([]types.Message, error) {
 }
 
 func (c *Consumer) process(ctx context.Context, msg types.Message) {
-	log := slog.With(
-		"message_id", aws.ToString(msg.MessageId),
-		"attempt", msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)],
-	)
+	// Zero if SQS did not send the count; such a message is never given up on.
+	attempt, _ := strconv.Atoi(msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
+	log := slog.With("message_id", aws.ToString(msg.MessageId), "attempt", attempt)
 	log.InfoContext(ctx, "message received")
 
 	stopHeartbeat := c.startHeartbeat(ctx, msg, log)
@@ -126,11 +132,15 @@ func (c *Consumer) process(ctx context.Context, msg types.Message) {
 			return
 		}
 		log.InfoContext(ctx, "shutting down, message released for another worker")
+	case attempt >= c.maxAttempts:
+		// Every delivery so far has failed; retrying again would only repeat
+		// the same work. The handler has already recorded the failure.
+		log.ErrorContext(ctx, "message failed on its last attempt, giving up", "error", err, "max_attempts", c.maxAttempts)
+		c.delete(ctx, msg, log)
 	default:
 		// Not deleted: once the heartbeat stops, SQS makes the message visible
-		// again within visibilityTimeout, and moves it to the dead-letter
-		// queue once it has been received too many times.
-		log.ErrorContext(ctx, "message failed, left on queue", "error", err)
+		// again within visibilityTimeout for another attempt.
+		log.ErrorContext(ctx, "message failed, left on queue for another attempt", "error", err)
 	}
 }
 

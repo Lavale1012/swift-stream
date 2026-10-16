@@ -176,14 +176,12 @@ func video() *fakeS3 {
 }
 
 func TestHandleDownloadsProcessesAndUploads(t *testing.T) {
-	// Point os.MkdirTemp at a directory the test can inspect afterwards.
 	tmp := t.TempDir()
-	t.Setenv("TMPDIR", tmp)
 
 	client := video()
 	store := &fakeStore{}
 	var gotPath, gotContent string
-	h := NewHandler(client, store, "processed", func(ctx context.Context, sourcePath, outDir string) (Output, error) {
+	h := NewHandler(client, store, "processed", tmp, func(ctx context.Context, sourcePath, outDir string) (Output, error) {
 		gotPath = sourcePath
 		data, err := os.ReadFile(sourcePath)
 		if err != nil {
@@ -243,7 +241,7 @@ func TestHandleDownloadsProcessesAndUploads(t *testing.T) {
 func TestHandleSkipsCompletedJob(t *testing.T) {
 	client := video()
 	store := &fakeStore{done: true}
-	h := NewHandler(client, store, "processed", func(context.Context, string, string) (Output, error) {
+	h := NewHandler(client, store, "processed", t.TempDir(), func(context.Context, string, string) (Output, error) {
 		t.Error("process called for a job that already completed")
 		return Output{}, nil
 	})
@@ -354,14 +352,13 @@ func TestHandleFailures(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tmp := t.TempDir()
-			t.Setenv("TMPDIR", tmp)
 
 			store := tt.store
 			if store == nil {
 				store = &fakeStore{}
 			}
 			processed := false
-			h := NewHandler(tt.client, store, "processed", func(ctx context.Context, sourcePath, outDir string) (Output, error) {
+			h := NewHandler(tt.client, store, "processed", tmp, func(ctx context.Context, sourcePath, outDir string) (Output, error) {
 				processed = true
 				if tt.processErr != nil {
 					return Output{}, tt.processErr
@@ -400,7 +397,7 @@ func TestHandleFailures(t *testing.T) {
 func TestHandleShutdownIsNotAFailure(t *testing.T) {
 	store := &fakeStore{}
 	ctx, cancel := context.WithCancel(context.Background())
-	h := NewHandler(video(), store, "processed", func(ctx context.Context, _, _ string) (Output, error) {
+	h := NewHandler(video(), store, "processed", t.TempDir(), func(ctx context.Context, _, _ string) (Output, error) {
 		cancel()
 		return Output{}, ctx.Err()
 	})
@@ -417,7 +414,7 @@ func TestHandleShutdownIsNotAFailure(t *testing.T) {
 func TestHandleIgnoresMessageWithNoUpload(t *testing.T) {
 	client := &fakeS3{}
 	store := &fakeStore{}
-	h := NewHandler(client, store, "processed", func(context.Context, string, string) (Output, error) {
+	h := NewHandler(client, store, "processed", t.TempDir(), func(context.Context, string, string) (Output, error) {
 		t.Error("process called for a message with no upload")
 		return Output{}, nil
 	})
