@@ -7,8 +7,8 @@ from botocore.exceptions import NoCredentialsError
 from fastapi.testclient import TestClient
 
 from app.aws import S3PutPresigner, s3_client
-from app.main import app
-from app.uploads import get_presigner
+from app.main import allowed_origins, app
+from app.routes.uploads import get_presigner
 
 
 class FakePresigner:
@@ -126,3 +126,54 @@ def test_startup_fails_without_upload_bucket(monkeypatch):
     with pytest.raises(RuntimeError, match="UPLOAD_BUCKET is not set"):
         with TestClient(app):
             pass
+
+
+def test_cors_preflight_allows_the_web_app(client):
+    response = client.options(
+        "/upload",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "POST" in response.headers["access-control-allow-methods"]
+    assert "content-type" in response.headers["access-control-allow-headers"].lower()
+
+
+def test_cors_preflight_rejects_other_origins(client):
+    response = client.options(
+        "/upload",
+        headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST"},
+    )
+    assert response.status_code == 400
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_cors_headers_on_the_upload_response(client):
+    response = client.post(
+        "/upload",
+        json={"contentType": "video/mp4", "size": 100},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+@pytest.mark.parametrize(
+    ("value", "want"),
+    [
+        pytest.param(None, ["http://localhost:5173"], id="unset uses the dev server"),
+        pytest.param("", ["http://localhost:5173"], id="empty uses the dev server"),
+        pytest.param("https://app.example.com/", ["https://app.example.com"], id="trailing slash dropped"),
+        pytest.param(
+            " https://app.example.com , http://localhost:5173 ,",
+            ["https://app.example.com", "http://localhost:5173"],
+            id="list with spaces",
+        ),
+    ],
+)
+def test_allowed_origins(value, want):
+    assert allowed_origins(value) == want
