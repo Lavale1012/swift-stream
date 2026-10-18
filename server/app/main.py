@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app import aws, uploads
+from app import aws
+from app.routes import health, uploads
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,17 +21,5 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="swift-stream API", lifespan=lifespan)
+app.include_router(health.router)
 app.include_router(uploads.router)
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    """Reports that the process is up and serving requests."""
-    return {"status": "ok"}
-
-
-@app.get("/ready")
-def ready() -> dict[str, str]:
-    """Reports that the API can accept requests. It has no dependencies to
-    check per request yet, so it always succeeds."""
-    return {"status": "ready"}

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.aws import S3PutPresigner, s3_client
 from app.main import app
-from app.uploads import get_presigner
+from app.routes.uploads import get_presigner
 
 
 class FakePresigner:
