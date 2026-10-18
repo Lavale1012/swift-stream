@@ -2,7 +2,6 @@
 package media
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,15 +23,9 @@ const (
 	audioBitrate   = "192k"
 	extractTimeout = 10 * time.Minute
 	probeTimeout   = 30 * time.Second
-	// stderrTail caps how much FFmpeg output is copied into an error.
+	// stderrTail caps how much FFmpeg output is kept for an error message.
 	stderrTail = 2000
 )
-
-func init() {
-	// ffmpeg-go otherwise prints every command through the log package; the
-	// command is logged with slog below instead.
-	ffmpeg.LogCompiledCommand = false
-}
 
 // CheckTools reports whether the ffmpeg and ffprobe binaries can be found.
 func CheckTools() error {
@@ -52,30 +45,32 @@ func ExtractAudio(ctx context.Context, sourcePath, outDir string) (string, error
 	defer cancel()
 
 	outPath := filepath.Join(outDir, audioFile)
-	var stderr bytes.Buffer
 	// ffmpeg -i <source> -b:a 192k -c:a libmp3lame -vn <out> -hide_banner -loglevel error -y
 	//   -vn             leave the video out
 	//   -c:a libmp3lame re-encode the audio as MP3, whatever codec the source used
 	//   -b:a            audio bitrate
-	stream := ffmpeg.Input(sourcePath).
+	args := ffmpeg.Input(sourcePath).
 		Output(outPath, ffmpeg.KwArgs{
 			"vn":  "",
 			"c:a": audioCodec,
 			"b:a": audioBitrate,
 		}).
-		GlobalArgs("-hide_banner", "-loglevel", "error")
-	// GlobalArgs returns a stream with a fresh background context, so ctx has
-	// to be attached after it. Set any earlier, the timeout and cancellation
-	// are silently dropped.
-	stream.Context = ctx
-	stream = stream.OverWriteOutput().WithErrorOutput(&stderr)
+		GlobalArgs("-hide_banner", "-loglevel", "error", "-y").
+		GetArgs()
 
-	slog.InfoContext(ctx, "running ffmpeg", "stage", "extract_audio", "args", strings.Join(stream.GetArgs(), " "))
-	if err := stream.Run(); err != nil {
+	// ffmpeg-go only builds the arguments. Starting the process here ties it
+	// to ctx; the library's own Run loses the context whenever a call such as
+	// GlobalArgs adds a node to the chain.
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stderr := &lastBytes{n: stderrTail}
+	cmd.Stderr = stderr
+
+	slog.InfoContext(ctx, "running ffmpeg", "stage", "extract_audio", "args", strings.Join(args, " "))
+	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
 			return "", fmt.Errorf("ffmpeg: %w", ctx.Err())
 		}
-		return "", fmt.Errorf("ffmpeg: %w: %s", err, tail(stderr.String()))
+		return "", fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(string(stderr.buf)))
 	}
 
 	// Exit status 0 is not proof of a usable file, so check what was written.
@@ -110,10 +105,17 @@ func verifyAudio(path string) error {
 	return nil
 }
 
-func tail(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) > stderrTail {
-		s = s[len(s)-stderrTail:]
+// lastBytes is a writer that keeps only the last n bytes written to it, so a
+// damaged source that makes FFmpeg print an error per packet cannot fill memory.
+type lastBytes struct {
+	n   int
+	buf []byte
+}
+
+func (w *lastBytes) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.n {
+		w.buf = append(w.buf[:0], w.buf[len(w.buf)-w.n:]...)
 	}
-	return s
+	return len(p), nil
 }

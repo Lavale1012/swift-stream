@@ -12,6 +12,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -40,16 +42,29 @@ type Output struct {
 // into outDir. Both are deleted once the result has been uploaded.
 type ProcessFunc func(ctx context.Context, sourcePath, outDir string) (Output, error)
 
+// Store records each job's progress. jobstate.Store implements it.
+type Store interface {
+	// Start marks the job as processing, or reports done if it has already
+	// completed.
+	Start(ctx context.Context, jobID, sourceBucket, sourceKey string, attempt int) (done bool, err error)
+	Complete(ctx context.Context, jobID, outputBucket, outputKey string) error
+	Fail(ctx context.Context, jobID, reason string) error
+}
+
 // Handler downloads each video named in a message, processes it, and uploads
-// the result.
+// the result, recording the job's progress as it goes.
 type Handler struct {
 	s3           S3
+	store        Store
 	outputBucket string
+	workDir      string
 	process      ProcessFunc
 }
 
-func NewHandler(client S3, outputBucket string, process ProcessFunc) *Handler {
-	return &Handler{s3: client, outputBucket: outputBucket, process: process}
+// NewHandler returns a Handler that puts each job's files in a new directory
+// under workDir.
+func NewHandler(client S3, store Store, outputBucket, workDir string, process ProcessFunc) *Handler {
+	return &Handler{s3: client, store: store, outputBucket: outputBucket, workDir: workDir, process: process}
 }
 
 // Handle processes one queue message whose body is an S3 event notification.
@@ -65,27 +80,77 @@ func (h *Handler) Handle(ctx context.Context, msg types.Message) error {
 			"message_id", aws.ToString(msg.MessageId))
 		return nil
 	}
+	// SQS counts every delivery, including ones a crashed worker never
+	// finished, so this is the true attempt number.
+	attempt, _ := strconv.Atoi(msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
 	for _, src := range sources {
-		if err := h.run(ctx, src); err != nil {
+		if err := h.run(ctx, src, attempt); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (h *Handler) run(ctx context.Context, src source) error {
-	log := slog.With("bucket", src.Bucket, "key", src.Key)
-
+func (h *Handler) run(ctx context.Context, src source, attempt int) error {
 	// Writing the result into the bucket that triggers jobs would create a new
 	// upload event for it, and the worker would process its own output forever.
 	if src.Bucket == h.outputBucket {
 		return errors.New("source bucket is also the output bucket, refusing to process")
 	}
-
-	// Each job gets its own directory, removed however the job ends.
-	dir, err := os.MkdirTemp("", "job-")
+	jobID, err := parseJobID(src.Key)
 	if err != nil {
-		return fmt.Errorf("create job directory: %w", err)
+		return err
+	}
+	log := slog.With("job_id", jobID, "bucket", src.Bucket, "key", src.Key, "attempt", attempt)
+
+	done, err := h.store.Start(ctx, jobID, src.Bucket, src.Key, attempt)
+	if err != nil {
+		return fmt.Errorf("record start of job %s: %w", jobID, err)
+	}
+	if done {
+		log.InfoContext(ctx, "job already completed, skipping redelivered message")
+		return nil
+	}
+
+	outputKey, err := h.work(ctx, log, src)
+	if err != nil {
+		// A shutdown is not a failure: the message is released and another
+		// worker starts the job again.
+		if ctx.Err() == nil {
+			if ferr := h.store.Fail(ctx, jobID, err.Error()); ferr != nil {
+				log.ErrorContext(ctx, "could not record job failure", "error", ferr)
+			}
+		}
+		return err
+	}
+
+	// The output is already uploaded, so record it even if shutdown has begun.
+	if err := h.store.Complete(context.WithoutCancel(ctx), jobID, h.outputBucket, outputKey); err != nil {
+		return fmt.Errorf("record completion of job %s: %w", jobID, err)
+	}
+	log.InfoContext(ctx, "processing complete", "stage", "upload",
+		"output_bucket", h.outputBucket, "output_key", outputKey)
+	return nil
+}
+
+// parseJobID returns the job ID in an upload key. The API's presigned uploads use
+// the layout uploads/<job id>/<file>, and the worker relies on it.
+func parseJobID(key string) (string, error) {
+	parts := strings.Split(key, "/")
+	if len(parts) != 3 || parts[0] != "uploads" || parts[1] == "" || parts[2] == "" {
+		return "", fmt.Errorf("key %q is not uploads/<job id>/<file>", key)
+	}
+	return parts[1], nil
+}
+
+// work downloads the source, processes it, uploads the result, and returns
+// the result's key in the output bucket.
+func (h *Handler) work(ctx context.Context, log *slog.Logger, src source) (string, error) {
+	// Each job gets its own directory, removed however the job ends. If the
+	// process dies first, the next worker to start removes it (see workdir).
+	dir, err := os.MkdirTemp(h.workDir, "job-")
+	if err != nil {
+		return "", fmt.Errorf("create job directory: %w", err)
 	}
 	defer os.RemoveAll(dir)
 
@@ -93,24 +158,22 @@ func (h *Handler) run(ctx context.Context, src source) error {
 	sourcePath := filepath.Join(dir, "source"+path.Ext(src.Key))
 	size, err := h.download(ctx, src, sourcePath)
 	if err != nil {
-		return fmt.Errorf("download s3://%s/%s: %w", src.Bucket, src.Key, err)
+		return "", fmt.Errorf("download s3://%s/%s: %w", src.Bucket, src.Key, err)
 	}
 
 	log.InfoContext(ctx, "video downloaded, processing", "stage", "process", "bytes", size)
 	out, err := h.process(ctx, sourcePath, dir)
 	if err != nil {
-		return fmt.Errorf("process s3://%s/%s: %w", src.Bucket, src.Key, err)
+		return "", fmt.Errorf("process s3://%s/%s: %w", src.Bucket, src.Key, err)
 	}
 
 	// The output sits beside the source's key, so a redelivered message
 	// overwrites the same object instead of creating a second one.
 	outputKey := path.Join(path.Dir(src.Key), filepath.Base(out.Path))
 	if err := h.upload(ctx, out, outputKey); err != nil {
-		return fmt.Errorf("upload s3://%s/%s: %w", h.outputBucket, outputKey, err)
+		return "", fmt.Errorf("upload s3://%s/%s: %w", h.outputBucket, outputKey, err)
 	}
-	log.InfoContext(ctx, "processing complete", "stage", "upload",
-		"output_bucket", h.outputBucket, "output_key", outputKey)
-	return nil
+	return outputKey, nil
 }
 
 func (h *Handler) upload(ctx context.Context, out Output, key string) error {
@@ -156,10 +219,6 @@ func (h *Handler) download(ctx context.Context, src source, dst string) (int64, 
 	}
 	if err != nil {
 		return 0, err
-	}
-	// A connection that drops cleanly mid-body would otherwise look complete.
-	if want := aws.ToInt64(out.ContentLength); out.ContentLength != nil && size != want {
-		return 0, fmt.Errorf("got %d bytes, object is %d", size, want)
 	}
 	return size, nil
 }

@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -12,7 +13,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
-const testQueueURL = "https://sqs.test/queue"
+const (
+	testQueueURL    = "https://sqs.test/queue"
+	testMaxAttempts = 3
+)
 
 // receiveResult is one scripted reply to ReceiveMessage.
 type receiveResult struct {
@@ -28,13 +32,16 @@ type fakeSQS struct {
 	receives  []*sqs.ReceiveMessageInput
 	deletes   []*sqs.DeleteMessageInput
 	deleteErr error
+	// visibility records the VisibilityTimeout of each ChangeMessageVisibility
+	// call, per receipt handle.
+	visibility map[string][]int32
 	// drained is closed when the script runs out, so a test knows every
 	// scripted message has been handled.
 	drained chan struct{}
 }
 
 func newFakeSQS(script ...receiveResult) *fakeSQS {
-	return &fakeSQS{script: script, drained: make(chan struct{})}
+	return &fakeSQS{script: script, drained: make(chan struct{}), visibility: map[string][]int32{}}
 }
 
 func (f *fakeSQS) ReceiveMessage(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
@@ -63,6 +70,20 @@ func (f *fakeSQS) DeleteMessage(_ context.Context, in *sqs.DeleteMessageInput, _
 	return &sqs.DeleteMessageOutput{}, f.deleteErr
 }
 
+func (f *fakeSQS) ChangeMessageVisibility(_ context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	handle := aws.ToString(in.ReceiptHandle)
+	f.visibility[handle] = append(f.visibility[handle], in.VisibilityTimeout)
+	return &sqs.ChangeMessageVisibilityOutput{}, nil
+}
+
+func (f *fakeSQS) visibilityChanges(handle string) []int32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.visibility[handle])
+}
+
 func (f *fakeSQS) deletedHandles() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -75,6 +96,13 @@ func (f *fakeSQS) deletedHandles() []string {
 
 func message(id string) types.Message {
 	return types.Message{MessageId: aws.String(id), ReceiptHandle: aws.String("receipt-" + id)}
+}
+
+// delivery returns message id as SQS hands it over for the given time.
+func delivery(id, attempt string) types.Message {
+	msg := message(id)
+	msg.Attributes = map[string]string{"ApproximateReceiveCount": attempt}
+	return msg
 }
 
 // runUntilDrained runs the consumer until every scripted receive has been
@@ -176,15 +204,15 @@ func TestRunDeletesOnlyMessagesThatSucceed(t *testing.T) {
 					return failure
 				}
 				return nil
-			})
+			}, testMaxAttempts)
 			c.backoff = time.Millisecond
 
 			runUntilDrained(t, c, f)
 
-			if !equal(handled, tt.wantHandled) {
+			if !slices.Equal(handled, tt.wantHandled) {
 				t.Errorf("handled %v, want %v", handled, tt.wantHandled)
 			}
-			if got := f.deletedHandles(); !equal(got, tt.wantDeleted) {
+			if got := f.deletedHandles(); !slices.Equal(got, tt.wantDeleted) {
 				t.Errorf("deleted %v, want %v", got, tt.wantDeleted)
 			}
 		})
@@ -193,7 +221,7 @@ func TestRunDeletesOnlyMessagesThatSucceed(t *testing.T) {
 
 func TestRunRequestsOneMessageWithLongPolling(t *testing.T) {
 	f := newFakeSQS(receiveResult{msgs: []types.Message{message("a")}})
-	c := New(f, testQueueURL, func(context.Context, types.Message) error { return nil })
+	c := New(f, testQueueURL, func(context.Context, types.Message) error { return nil }, testMaxAttempts)
 
 	runUntilDrained(t, c, f)
 
@@ -204,24 +232,53 @@ func TestRunRequestsOneMessageWithLongPolling(t *testing.T) {
 	if in.MaxNumberOfMessages != 1 || in.WaitTimeSeconds != 20 {
 		t.Errorf("max messages = %d, wait = %ds; want 1 and 20s", in.MaxNumberOfMessages, in.WaitTimeSeconds)
 	}
+	if in.VisibilityTimeout != 120 {
+		t.Errorf("visibility timeout = %ds, want 120s", in.VisibilityTimeout)
+	}
+	if !slices.Contains(in.MessageSystemAttributeNames, types.MessageSystemAttributeNameApproximateReceiveCount) {
+		t.Errorf("attributes = %v, want the receive count", in.MessageSystemAttributeNames)
+	}
 	if got := aws.ToString(f.deletes[0].QueueUrl); got != testQueueURL {
 		t.Errorf("delete queue = %q", got)
 	}
 }
 
-// TestRunFinishesCurrentMessageOnShutdown cancels the consumer while the
-// handler is running, as SIGTERM would.
-func TestRunFinishesCurrentMessageOnShutdown(t *testing.T) {
+func TestRunExtendsVisibilityWhileHandling(t *testing.T) {
 	f := newFakeSQS(receiveResult{msgs: []types.Message{message("a")}})
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var handlerCtxErr error
-	c := New(f, testQueueURL, func(ctx context.Context, _ types.Message) error {
-		close(started)
-		<-release
-		handlerCtxErr = ctx.Err()
+	c := New(f, testQueueURL, func(context.Context, types.Message) error {
+		time.Sleep(100 * time.Millisecond)
 		return nil
-	})
+	}, testMaxAttempts)
+	c.heartbeat = 10 * time.Millisecond
+
+	runUntilDrained(t, c, f)
+
+	changes := f.visibilityChanges("receipt-a")
+	if len(changes) < 3 {
+		t.Fatalf("visibility extended %d times during a 100ms job with a 10ms heartbeat, want several", len(changes))
+	}
+	for _, v := range changes {
+		if v != 120 {
+			t.Errorf("visibility set to %ds, want 120s", v)
+		}
+	}
+	// The heartbeat must stop with the handler, or it would keep a deleted
+	// or failed message's receipt handle alive.
+	time.Sleep(50 * time.Millisecond)
+	if after := f.visibilityChanges("receipt-a"); len(after) != len(changes) {
+		t.Errorf("visibility changed %d more times after the handler returned", len(after)-len(changes))
+	}
+}
+
+// shutDownDuring runs the consumer on one message and cancels it, as SIGTERM
+// would, once the handler has started. It returns after Run does.
+func shutDownDuring(t *testing.T, f *fakeSQS, handle Handler) {
+	t.Helper()
+	started := make(chan struct{})
+	c := New(f, testQueueURL, func(ctx context.Context, msg types.Message) error {
+		close(started)
+		return handle(ctx, msg)
+	}, testMaxAttempts)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -234,35 +291,87 @@ func TestRunFinishesCurrentMessageOnShutdown(t *testing.T) {
 	cancel()
 	select {
 	case <-done:
-		t.Fatal("Run returned while the handler was still running")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	select {
-	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after the handler finished")
-	}
-
-	if handlerCtxErr != nil {
-		t.Errorf("handler context was cancelled by shutdown: %v", handlerCtxErr)
-	}
-	if got := f.deletedHandles(); !equal(got, []string{"receipt-a"}) {
-		t.Errorf("deleted %v, want the in-flight message", got)
+		t.Fatal("Run did not return after shutdown")
 	}
 	if len(f.receives) != 1 {
 		t.Errorf("received %d times, want no receive after shutdown", len(f.receives))
 	}
 }
 
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+func TestRunReleasesMessageOnShutdown(t *testing.T) {
+	f := newFakeSQS(receiveResult{msgs: []types.Message{message("a")}})
+	shutDownDuring(t, f, func(ctx context.Context, _ types.Message) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	if got := f.visibilityChanges("receipt-a"); !slices.Equal(got, []int32{0}) {
+		t.Errorf("visibility changes = %v, want one release to 0", got)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+	if got := f.deletedHandles(); len(got) != 0 {
+		t.Errorf("deleted %v, want the message left for another worker", got)
 	}
-	return true
+}
+
+func TestRunDeletesMessageThatFinishesDuringShutdown(t *testing.T) {
+	f := newFakeSQS(receiveResult{msgs: []types.Message{message("a")}})
+	shutDownDuring(t, f, func(ctx context.Context, _ types.Message) error {
+		<-ctx.Done()
+		return nil // finished anyway
+	})
+
+	if got := f.deletedHandles(); !slices.Equal(got, []string{"receipt-a"}) {
+		t.Errorf("deleted %v, want the finished message", got)
+	}
+	if got := f.visibilityChanges("receipt-a"); len(got) != 0 {
+		t.Errorf("visibility changes = %v, want none for a finished message", got)
+	}
+}
+
+func TestRunGivesUpAfterMaxAttempts(t *testing.T) {
+	tests := []struct {
+		name        string
+		msg         types.Message
+		fail        bool
+		wantDeleted bool
+	}{
+		{name: "failure before the last attempt is retried", msg: delivery("a", "2"), fail: true},
+		{name: "failure on the last attempt is given up", msg: delivery("a", "3"), fail: true, wantDeleted: true},
+		{name: "failure past the last attempt is given up", msg: delivery("a", "7"), fail: true, wantDeleted: true},
+		{name: "failure with no receive count is retried", msg: message("a"), fail: true},
+		{name: "success on the last attempt is deleted", msg: delivery("a", "3"), wantDeleted: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeSQS(receiveResult{msgs: []types.Message{tt.msg}})
+			c := New(f, testQueueURL, func(context.Context, types.Message) error {
+				if tt.fail {
+					return errors.New("video has no audio")
+				}
+				return nil
+			}, testMaxAttempts)
+
+			runUntilDrained(t, c, f)
+
+			if deleted := len(f.deletedHandles()) == 1; deleted != tt.wantDeleted {
+				t.Errorf("deleted = %v, want %v", deleted, tt.wantDeleted)
+			}
+		})
+	}
+}
+
+func TestRunReleasesLastAttemptOnShutdown(t *testing.T) {
+	f := newFakeSQS(receiveResult{msgs: []types.Message{delivery("a", "3")}})
+	shutDownDuring(t, f, func(ctx context.Context, _ types.Message) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	if got := f.deletedHandles(); len(got) != 0 {
+		t.Errorf("deleted %v; a shutdown is not a failure, so the message must be released", got)
+	}
+	if got := f.visibilityChanges("receipt-a"); !slices.Equal(got, []int32{0}) {
+		t.Errorf("visibility changes = %v, want one release to 0", got)
+	}
 }

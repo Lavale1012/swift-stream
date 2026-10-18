@@ -4,6 +4,7 @@ package consumer
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -16,35 +17,57 @@ const (
 	// message instead of returning empty straight away.
 	longPollSeconds = 20
 	receiveTimeout  = (longPollSeconds + 10) * time.Second
-	deleteTimeout   = 10 * time.Second
-	defaultBackoff  = 5 * time.Second
+	// visibilityTimeout is how long SQS hides a received message from other
+	// workers. It is kept short and renewed on every heartbeat while the
+	// message is being worked on, so a worker that dies holds its message for
+	// at most this long.
+	visibilityTimeout = 2 * time.Minute
+	defaultHeartbeat  = visibilityTimeout / 2
+	sqsCallTimeout    = 10 * time.Second
+	defaultBackoff    = 5 * time.Second
 )
 
 // SQS is the part of the SQS client the consumer needs.
 type SQS interface {
 	ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
 	DeleteMessage(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
+	ChangeMessageVisibility(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
 }
 
 // Handler processes one message. Returning an error leaves the message on
-// the queue to be delivered again.
+// the queue to be delivered again. ctx is cancelled when the worker shuts
+// down; the handler should then stop and return, and the message is handed
+// back to the queue for another worker.
 type Handler func(ctx context.Context, msg types.Message) error
 
 // Consumer polls one queue and runs a Handler for each message, one at a time.
 type Consumer struct {
-	client   SQS
-	queueURL string
-	handle   Handler
-	backoff  time.Duration
+	client      SQS
+	queueURL    string
+	handle      Handler
+	maxAttempts int
+	backoff     time.Duration
+	heartbeat   time.Duration
 }
 
-func New(client SQS, queueURL string, handle Handler) *Consumer {
-	return &Consumer{client: client, queueURL: queueURL, handle: handle, backoff: defaultBackoff}
+// New returns a Consumer that deletes a message once it has failed on its
+// maxAttempts-th delivery, so a message that can never succeed stops being
+// retried. A dead-letter queue does this job better; when the queue has one,
+// keep its maxReceiveCount below maxAttempts so SQS moves the message first.
+func New(client SQS, queueURL string, handle Handler, maxAttempts int) *Consumer {
+	return &Consumer{
+		client:      client,
+		queueURL:    queueURL,
+		handle:      handle,
+		maxAttempts: maxAttempts,
+		backoff:     defaultBackoff,
+		heartbeat:   defaultHeartbeat,
+	}
 }
 
-// Run polls the queue until ctx is cancelled. A message that has already
-// been received when ctx is cancelled is still processed to the end before
-// Run returns.
+// Run polls the queue until ctx is cancelled. If ctx is cancelled while a
+// message is being handled, the handler is stopped and the message is
+// released so another worker can pick it up straight away.
 func (c *Consumer) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		msgs, err := c.receive(ctx)
@@ -62,8 +85,7 @@ func (c *Consumer) Run(ctx context.Context) {
 			continue
 		}
 		for _, msg := range msgs {
-			// Shutdown must not interrupt a message that is in progress.
-			c.process(context.WithoutCancel(ctx), msg)
+			c.process(ctx, msg)
 		}
 	}
 }
@@ -77,6 +99,10 @@ func (c *Consumer) receive(ctx context.Context) ([]types.Message, error) {
 		// on would use up its visibility timeout while it waits.
 		MaxNumberOfMessages: 1,
 		WaitTimeSeconds:     longPollSeconds,
+		VisibilityTimeout:   int32(visibilityTimeout / time.Second),
+		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
+			types.MessageSystemAttributeNameApproximateReceiveCount,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -85,18 +111,81 @@ func (c *Consumer) receive(ctx context.Context) ([]types.Message, error) {
 }
 
 func (c *Consumer) process(ctx context.Context, msg types.Message) {
-	log := slog.With("message_id", aws.ToString(msg.MessageId))
-
+	// Zero if SQS did not send the count; such a message is never given up on.
+	attempt, _ := strconv.Atoi(msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
+	log := slog.With("message_id", aws.ToString(msg.MessageId), "attempt", attempt)
 	log.InfoContext(ctx, "message received")
-	if err := c.handle(ctx, msg); err != nil {
-		// Not deleted: SQS makes it visible again after the visibility
-		// timeout, and moves it to the dead-letter queue once it has been
-		// received too many times.
-		log.ErrorContext(ctx, "message failed, left on queue", "error", err)
-		return
-	}
 
-	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	stopHeartbeat := c.startHeartbeat(ctx, msg, log)
+	err := c.handle(ctx, msg)
+	stopHeartbeat()
+
+	shuttingDown := ctx.Err() != nil
+	// The calls below must run even though shutdown may have cancelled ctx.
+	ctx = context.WithoutCancel(ctx)
+	switch {
+	case err == nil:
+		c.delete(ctx, msg, log)
+	case shuttingDown:
+		if err := c.setVisibility(ctx, msg, 0); err != nil {
+			log.ErrorContext(ctx, "release failed, message returns after its visibility timeout", "error", err)
+			return
+		}
+		log.InfoContext(ctx, "shutting down, message released for another worker")
+	case attempt >= c.maxAttempts:
+		// Every delivery so far has failed; retrying again would only repeat
+		// the same work. The handler has already recorded the failure.
+		log.ErrorContext(ctx, "message failed on its last attempt, giving up", "error", err, "max_attempts", c.maxAttempts)
+		c.delete(ctx, msg, log)
+	default:
+		// Not deleted: once the heartbeat stops, SQS makes the message visible
+		// again within visibilityTimeout for another attempt.
+		log.ErrorContext(ctx, "message failed, left on queue for another attempt", "error", err)
+	}
+}
+
+// startHeartbeat keeps extending the message's visibility timeout until the
+// returned function is called, so SQS does not hand the message to another
+// worker while this one is still working on it.
+func (c *Consumer) startHeartbeat(ctx context.Context, msg types.Message, log *slog.Logger) (stop func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(c.heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := c.setVisibility(ctx, msg, visibilityTimeout); err != nil {
+					log.WarnContext(ctx, "extend visibility failed", "error", err)
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+// setVisibility hides the message for d from now. Zero makes it visible to
+// other workers immediately.
+func (c *Consumer) setVisibility(ctx context.Context, msg types.Message, d time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, sqsCallTimeout)
+	defer cancel()
+	_, err := c.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		QueueUrl:          aws.String(c.queueURL),
+		ReceiptHandle:     msg.ReceiptHandle,
+		VisibilityTimeout: int32(d / time.Second),
+	})
+	return err
+}
+
+func (c *Consumer) delete(ctx context.Context, msg types.Message, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(ctx, sqsCallTimeout)
 	defer cancel()
 	_, err := c.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(c.queueURL),
