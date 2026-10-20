@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.aws import PutPresigner
+from app.jobs import JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -24,28 +25,37 @@ UPLOAD_EXTENSIONS = {
 }
 
 
-class PresignError(Exception):
-    """S3 could not sign the upload URL. The cause is logged, not carried,
-    so callers cannot leak it to the client."""
+class UploadError(Exception):
+    """S3 could not sign the upload URL, or the job record could not be
+    written. The cause is logged, not carried, so callers cannot leak it to
+    the client."""
 
 
 @dataclass(frozen=True)
 class PresignedUpload:
     url: str
     key: str
+    job_id: str
     expires_in: int
 
 
-def create_upload(presigner: PutPresigner, content_type: str, size: int) -> PresignedUpload:
-    """Picks a new object key for a video of content_type and exactly size
-    bytes, and returns a URL that lets the client PUT it there. The caller
-    must have checked content_type against UPLOAD_EXTENSIONS and size against
-    MAX_UPLOAD_BYTES."""
-    key = f"uploads/{uuid.uuid4().hex}/source{UPLOAD_EXTENSIONS[content_type]}"
+def create_upload(
+    presigner: PutPresigner, jobs: JobStore, content_type: str, size: int
+) -> PresignedUpload:
+    """Starts a job for a video of content_type and exactly size bytes:
+    picks its object key, records the job as pending, and returns a URL that
+    lets the client PUT the video there. The caller must have checked
+    content_type against UPLOAD_EXTENSIONS and size against MAX_UPLOAD_BYTES."""
+    job_id = uuid.uuid4().hex
+    key = f"uploads/{job_id}/source{UPLOAD_EXTENSIONS[content_type]}"
     try:
         url = presigner.presign_put(key, content_type, size, UPLOAD_URL_EXPIRY_SECONDS)
+        # The record must exist before the client has the URL, so the job is
+        # never unknown between the upload and the worker picking it up.
+        # Presigning first means a failed presign leaves no record behind.
+        jobs.create(job_id, key)
     except (BotoCoreError, ClientError):
-        logger.exception("presign upload failed key=%s", key)
-        raise PresignError from None
+        logger.exception("create upload failed job_id=%s", job_id)
+        raise UploadError from None
 
-    return PresignedUpload(url=url, key=key, expires_in=UPLOAD_URL_EXPIRY_SECONDS)
+    return PresignedUpload(url=url, key=key, job_id=job_id, expires_in=UPLOAD_URL_EXPIRY_SECONDS)

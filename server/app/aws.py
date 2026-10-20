@@ -1,4 +1,5 @@
-"""AWS setup and the S3 presigner used by the upload route."""
+"""AWS setup and the S3 presigners: PUT into the upload bucket for the upload
+route, GET from the output bucket for the media routes."""
 
 import logging
 from typing import Protocol
@@ -8,7 +9,7 @@ from botocore.config import Config
 
 logger = logging.getLogger(__name__)
 
-_TIMEOUTS = {"connect_timeout": 5, "read_timeout": 5}
+TIMEOUTS = {"connect_timeout": 5, "read_timeout": 5}
 
 
 class PutPresigner(Protocol):
@@ -37,20 +38,50 @@ class S3PutPresigner:
         )
 
 
+class GetPresigner(Protocol):
+    """What the media routes need from the output bucket, so tests can pass a
+    fake."""
+
+    def presign_get(self, key: str, expires_in: int, download_as: str | None = None) -> str: ...
+
+
+class S3GetPresigner:
+    def __init__(self, client, bucket: str) -> None:
+        self._client = client
+        self._bucket = bucket
+
+    def presign_get(self, key: str, expires_in: int, download_as: str | None = None) -> str:
+        # S3 sends ResponseContentDisposition back as the Content-Disposition
+        # header. "inline" lets the browser play the file (an <audio> element
+        # streams it with Range requests, so seeking works); "attachment"
+        # makes it save the file as download_as instead. It is a signed query
+        # parameter, not a header the client has to send.
+        disposition = f'attachment; filename="{download_as}"' if download_as else "inline"
+        return self._client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": self._bucket,
+                "Key": key,
+                "ResponseContentDisposition": disposition,
+            },
+            ExpiresIn=expires_in,
+        )
+
+
 def s3_client(session: boto3.Session):
     # SigV4 is required for the signed headers above; older defaults can
     # fall back to SigV2 for presigned URLs.
-    return session.client("s3", config=Config(signature_version="s3v4", **_TIMEOUTS))
+    return session.client("s3", config=Config(signature_version="s3v4", **TIMEOUTS))
 
 
-def connect(bucket: str) -> S3PutPresigner:
+def connect() -> boto3.Session:
     """Load credentials and region from the default chain (environment
     variables, the ~/.aws files, or an attached IAM role), confirm they work
-    by asking STS who we are, and return a presigner for bucket."""
+    by asking STS who we are, and return the session."""
     session = boto3.Session()
     if session.region_name is None:
         raise RuntimeError("aws region not set: set AWS_REGION or a region in ~/.aws/config")
 
-    identity = session.client("sts", config=Config(**_TIMEOUTS)).get_caller_identity()
+    identity = session.client("sts", config=Config(**TIMEOUTS)).get_caller_identity()
     logger.info("aws: authenticated as %s in %s", identity["Arn"], session.region_name)
-    return S3PutPresigner(s3_client(session), bucket)
+    return session
