@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import aws
-from app.routes import health, uploads
+from app import aws, jobs
+from app.routes import health, media, uploads
 
 logging.basicConfig(level=logging.INFO)
 
@@ -28,10 +28,23 @@ def allowed_origins(value: str | None) -> list[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail at startup, not on the first request, if configuration is missing.
-    bucket = os.environ.get("UPLOAD_BUCKET")
-    if not bucket:
+    upload_bucket = os.environ.get("UPLOAD_BUCKET")
+    if not upload_bucket:
         raise RuntimeError("UPLOAD_BUCKET is not set")
-    app.state.presigner = aws.connect(bucket)
+    # OUTPUT_BUCKET and JOBS_TABLE are the worker's: where it writes
+    # processed media, and where it records each job's status.
+    output_bucket = os.environ.get("OUTPUT_BUCKET")
+    if not output_bucket:
+        raise RuntimeError("OUTPUT_BUCKET is not set")
+    jobs_table = os.environ.get("JOBS_TABLE")
+    if not jobs_table:
+        raise RuntimeError("JOBS_TABLE is not set")
+
+    session = aws.connect()
+    s3 = aws.s3_client(session)
+    app.state.presigner = aws.S3PutPresigner(s3, upload_bucket)
+    app.state.output_presigner = aws.S3GetPresigner(s3, output_bucket)
+    app.state.jobs = jobs.DynamoJobStore(jobs.dynamodb_client(session), jobs_table)
     yield
 
 
@@ -49,3 +62,4 @@ app.add_middleware(
 )
 app.include_router(health.router)
 app.include_router(uploads.router)
+app.include_router(media.router)

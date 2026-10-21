@@ -50,7 +50,7 @@ The workers scale on queue depth and scale to zero when there is nothing to do.
 ## Repository layout
 
 ```text
-server/   HTTP API (FastAPI): issues presigned upload URLs
+server/   HTTP API (FastAPI): issues presigned upload and download URLs
 worker/   Go worker: consumes SQS jobs, runs FFmpeg, records job state
 client/   Web app (React + Vite), currently an empty scaffold
 infra/    Terraform for the AWS resources
@@ -58,7 +58,8 @@ infra/    Terraform for the AWS resources
 
 ### `server/`: API
 
-- `POST /upload` takes `{ "contentType": ..., "size": ... }` and returns a presigned S3 PUT URL that expires after 15 minutes. The object key is `uploads/<job id>/source.<ext>`. The content type and exact size are part of the signature, so S3 rejects an upload that doesn't match what was requested.
+- `POST /upload` takes `{ "contentType": ..., "size": ... }`, creates a job in DynamoDB with status `pending`, and returns its `jobId` with a presigned S3 PUT URL that expires after 15 minutes. The object key is `uploads/<job id>/source.<ext>`. The content type and exact size are part of the signature, so S3 rejects an upload that doesn't match what was requested.
+- `GET /jobs/<job id>/audio` returns `{ "playUrl": ..., "downloadUrl": ..., "expiresIn": 900 }` once the job has completed: presigned S3 URLs for the extracted audio, one to play in the browser (for example as an `<audio>` element's `src`) and one that downloads it as `audio.mp3`. It returns 404 for an unknown job and 409 while the job is pending, processing, or failed.
 - `GET /health` and `GET /ready` are for liveness and readiness checks.
 - Routes (`app/routes/`) hold only the HTTP layer. The logic lives in `app/handlers/`, which doesn't import FastAPI, so it can be tested without HTTP.
 - At startup the API checks its AWS credentials with an STS call and exits if they don't work.
@@ -102,7 +103,7 @@ Building it this way raised a few problems worth calling out:
 ```sh
 cd server
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-UPLOAD_BUCKET=<bucket> .venv/bin/python -m app    # serves on :8080; set PORT to change it
+UPLOAD_BUCKET=<raw bucket> OUTPUT_BUCKET=<processed bucket> JOBS_TABLE=<table> .venv/bin/python -m app    # serves on :8080; set PORT to change it
 .venv/bin/pytest
 ```
 

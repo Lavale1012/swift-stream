@@ -1,40 +1,12 @@
 import re
 from urllib.parse import parse_qs, urlsplit
 
-import boto3
 import pytest
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError
 from fastapi.testclient import TestClient
 
 from app.aws import S3PutPresigner, s3_client
 from app.main import allowed_origins, app
-from app.routes.uploads import get_presigner
-
-
-class FakePresigner:
-    def __init__(self, error: Exception | None = None) -> None:
-        self.calls: list[tuple[str, str, int, int]] = []
-        self.error = error
-
-    def presign_put(self, key: str, content_type: str, size: int, expires_in: int) -> str:
-        self.calls.append((key, content_type, size, expires_in))
-        if self.error:
-            raise self.error
-        return "https://example.test/signed"
-
-
-@pytest.fixture
-def presigner():
-    return FakePresigner()
-
-
-@pytest.fixture
-def client(presigner):
-    # TestClient is not used as a context manager, so the startup code that
-    # talks to AWS does not run.
-    app.dependency_overrides[get_presigner] = lambda: presigner
-    yield TestClient(app)
-    app.dependency_overrides.clear()
 
 
 def test_health_and_ready(client):
@@ -56,55 +28,64 @@ def test_health_and_ready(client):
         pytest.param('{"contentType": "video/mp4", "size": "100"}', id="size as string"),
     ],
 )
-def test_upload_rejects_bad_requests(client, presigner, body):
+def test_upload_rejects_bad_requests(client, presigner, jobs, body):
     response = client.post("/upload", content=body, headers={"Content-Type": "application/json"})
     assert response.status_code == 422, response.text
     assert presigner.calls == []
+    assert jobs.created == []
 
 
-def test_upload_rejects_form_file(client, presigner):
+def test_upload_rejects_form_file(client, presigner, jobs):
     response = client.post("/upload", files={"video": b"video bytes"})
     assert response.status_code == 422, response.text
     assert presigner.calls == []
+    assert jobs.created == []
 
 
-def test_upload_returns_presigned_url(client, presigner):
+def test_upload_returns_presigned_url(client, presigner, jobs):
     response = client.post("/upload", json={"contentType": "video/quicktime", "size": 1 << 30})
     assert response.status_code == 200, response.text
 
     body = response.json()
-    assert re.fullmatch(r"uploads/[0-9a-f]{32}/source\.mov", body["key"])
+    job_id = body["jobId"]
+    assert re.fullmatch(r"[0-9a-f]{32}", job_id)
     assert body == {
+        "jobId": job_id,
         "url": "https://example.test/signed",
         "method": "PUT",
         "headers": {"Content-Type": "video/quicktime"},
-        "key": body["key"],
+        "key": f"uploads/{job_id}/source.mov",
         "expiresIn": 900,
     }
     assert presigner.calls == [(body["key"], "video/quicktime", 1 << 30, 900)]
+    assert jobs.created == [(job_id, body["key"])]
 
 
-def test_upload_keys_are_unique(client):
+def test_upload_job_ids_are_unique(client):
     body = {"contentType": "video/mp4", "size": 100}
-    first = client.post("/upload", json=body).json()["key"]
-    second = client.post("/upload", json=body).json()["key"]
+    first = client.post("/upload", json=body).json()["jobId"]
+    second = client.post("/upload", json=body).json()["jobId"]
     assert first != second
 
 
-def test_upload_hides_presign_error(client, presigner):
+def test_upload_hides_presign_error(client, presigner, jobs):
     presigner.error = NoCredentialsError()
+    response = client.post("/upload", json={"contentType": "video/mp4", "size": 100})
+    assert response.status_code == 500
+    assert response.json() == {"detail": "could not create upload URL"}
+    assert jobs.created == [], "a failed presign must not leave a job behind"
+
+
+def test_upload_hides_job_store_error(client, jobs):
+    jobs.error = ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "PutItem")
     response = client.post("/upload", json={"contentType": "video/mp4", "size": 100})
     assert response.status_code == 500
     assert response.json() == {"detail": "could not create upload URL"}
 
 
-def test_presigned_url_signs_size_and_type():
-    """Runs the real boto3 signer with fake credentials (presigning makes no
-    network call) to pin down what the signature covers."""
-    session = boto3.Session(
-        aws_access_key_id="AKIDEXAMPLE", aws_secret_access_key="secret", region_name="us-east-1"
-    )
-    url = S3PutPresigner(s3_client(session), "raw-bucket").presign_put(
+def test_presigned_url_signs_size_and_type(aws_session):
+    """Runs the real boto3 signer to pin down what the signature covers."""
+    url = S3PutPresigner(s3_client(aws_session), "raw-bucket").presign_put(
         "uploads/abc/source.mp4", "video/mp4", 4096, 900
     )
 
@@ -121,9 +102,12 @@ def test_presigned_url_signs_size_and_type():
     assert not [name for name in query if "checksum" in name.lower()]
 
 
-def test_startup_fails_without_upload_bucket(monkeypatch):
-    monkeypatch.delenv("UPLOAD_BUCKET", raising=False)
-    with pytest.raises(RuntimeError, match="UPLOAD_BUCKET is not set"):
+@pytest.mark.parametrize("missing", ["UPLOAD_BUCKET", "OUTPUT_BUCKET", "JOBS_TABLE"])
+def test_startup_fails_without_config(monkeypatch, missing):
+    for name in ("UPLOAD_BUCKET", "OUTPUT_BUCKET", "JOBS_TABLE"):
+        monkeypatch.setenv(name, "configured")
+    monkeypatch.delenv(missing)
+    with pytest.raises(RuntimeError, match=f"{missing} is not set"):
         with TestClient(app):
             pass
 
