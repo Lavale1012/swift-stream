@@ -1,3 +1,9 @@
+variable "aws_region" {
+  description = "AWS region for every resource. The state backend's region is set separately in versions.tf."
+  type        = string
+  default     = "us-east-1"
+}
+
 variable "project_name" {
   description = "Prefix for resource names, such as the VPC's name."
   type        = string
@@ -107,6 +113,17 @@ variable "upload_cors_allowed_origins" {
   default     = ["http://localhost:5173"]
 }
 
+variable "upload_expiration_days" {
+  description = "Days after which uploaded source videos are deleted from the raw uploads bucket. A job, or a retry of it, that starts later than this fails because its source is gone."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.upload_expiration_days >= 1 && floor(var.upload_expiration_days) == var.upload_expiration_days
+    error_message = "upload_expiration_days must be a whole number of days, at least 1."
+  }
+}
+
 variable "force_destroy_buckets" {
   description = "Let terraform destroy delete the S3 buckets even when they still hold objects, deleting the objects too. Keep this off outside dev."
   type        = bool
@@ -114,7 +131,7 @@ variable "force_destroy_buckets" {
 }
 
 variable "tags" {
-  description = "Extra tags added to every resource the module creates."
+  description = "Extra tags added to every resource, on top of Project, Environment and Terraform."
   type        = map(string)
   default     = {}
 }

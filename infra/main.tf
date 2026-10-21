@@ -8,12 +8,7 @@ module "vpc" {
   private_subnets = var.private_subnet_cidrs
   public_subnets  = var.public_subnet_cidrs
 
-  enable_nat_gateway = var.enable_nat_gateway
-
-  tags = merge(var.tags, {
-    Terraform   = "true"
-    Environment = var.environment
-  })
+  single_nat_gateway = var.enable_nat_gateway
 }
 
 module "ecs" {
@@ -40,11 +35,6 @@ module "ecs" {
 
   # Services (worker, API) are added here once their queue, buckets, and ECR repo exist.
   services = {}
-
-  tags = merge(var.tags, {
-    Terraform   = "true"
-    Environment = var.environment
-  })
 }
 
 # Source videos uploaded by the browser through presigned URLs (the API's UPLOAD_BUCKET).
@@ -53,10 +43,11 @@ module "s3_raw_uploads" {
   version = "~> 5.17"
 
   bucket = var.raw_uploads_bucket_name
-  acl    = "private"
 
+  # ACLs off: the bucket owner owns every object, and access is decided by
+  # IAM and bucket policies alone. AWS recommends this for new buckets.
   control_object_ownership = true
-  object_ownership         = "ObjectWriter"
+  object_ownership         = "BucketOwnerEnforced"
 
   force_destroy = var.force_destroy_buckets
 
@@ -69,6 +60,29 @@ module "s3_raw_uploads" {
     max_age_seconds = 3000
   }]
 
+  # Source videos are only needed while their job runs, including retries, so
+  # they expire; the pipeline's output in the processed bucket is kept. With
+  # versioning on, expiring a video only adds a delete marker on top of it, so
+  # the hidden old version is removed a day later, and the marker left behind
+  # is removed by the second rule. (S3 does not allow expiry by days and
+  # marker removal in the same rule.)
+  lifecycle_rule = [
+    {
+      id                                     = "expire-uploads"
+      enabled                                = true
+      filter                                 = { prefix = "uploads/" }
+      expiration                             = { days = var.upload_expiration_days }
+      noncurrent_version_expiration          = { noncurrent_days = 1 }
+      abort_incomplete_multipart_upload_days = 1
+    },
+    {
+      id         = "remove-expired-delete-markers"
+      enabled    = true
+      filter     = { prefix = "uploads/" }
+      expiration = { expired_object_delete_marker = true }
+    },
+  ]
+
   versioning = {
     enabled = true
   }
@@ -80,10 +94,11 @@ module "s3_processed" {
   version = "~> 5.17"
 
   bucket = var.processed_bucket_name
-  acl    = "private"
 
+  # ACLs off: the bucket owner owns every object, and access is decided by
+  # IAM and bucket policies alone. AWS recommends this for new buckets.
   control_object_ownership = true
-  object_ownership         = "ObjectWriter"
+  object_ownership         = "BucketOwnerEnforced"
 
   force_destroy = var.force_destroy_buckets
 
@@ -98,10 +113,11 @@ module "s3_web" {
   version = "~> 5.17"
 
   bucket = var.web_bucket_name
-  acl    = "private"
 
+  # ACLs off: the bucket owner owns every object, and access is decided by
+  # IAM and bucket policies alone. AWS recommends this for new buckets.
   control_object_ownership = true
-  object_ownership         = "ObjectWriter"
+  object_ownership         = "BucketOwnerEnforced"
 
   force_destroy = var.force_destroy_buckets
 
