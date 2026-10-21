@@ -124,10 +124,64 @@ variable "upload_expiration_days" {
   }
 }
 
+variable "job_max_receive_count" {
+  description = "Deliveries a job message gets before SQS moves it to the dead-letter queue. Must stay below the worker's maxAttempts (5 in worker/main.go), or the worker deletes failing messages before they reach the DLQ."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.job_max_receive_count >= 1 && var.job_max_receive_count < 5
+    error_message = "job_max_receive_count must be between 1 and 4, below the worker's maxAttempts of 5."
+  }
+}
+
+variable "job_retention_days" {
+  description = "Days an unprocessed job message stays in the job queue before SQS discards it."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.job_retention_days >= 1 && var.job_retention_days <= 14
+    error_message = "SQS keeps messages for 1 to 14 days."
+  }
+}
+
+variable "dlq_retention_days" {
+  description = "Days a failed job message stays in the dead-letter queue, for inspection or redrive."
+  type        = number
+  default     = 14
+
+  validation {
+    condition     = var.dlq_retention_days >= 1 && var.dlq_retention_days <= 14
+    error_message = "SQS keeps messages for 1 to 14 days."
+  }
+}
+
 variable "force_destroy_buckets" {
   description = "Let terraform destroy delete the S3 buckets even when they still hold objects, deleting the objects too. Keep this off outside dev."
   type        = bool
   default     = true
+}
+
+variable "monthly_budget_usd" {
+  description = "Monthly AWS spend, in US dollars, that the budget alerts are measured against. Covers the whole account."
+  type        = number
+  default     = 25
+
+  validation {
+    condition     = var.monthly_budget_usd > 0
+    error_message = "monthly_budget_usd must be more than 0."
+  }
+}
+
+variable "budget_alert_emails" {
+  description = "Email addresses that receive the budget alerts."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.budget_alert_emails) > 0 && alltrue([for e in var.budget_alert_emails : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", e))])
+    error_message = "Give at least one email address, each of the form name@example.com."
+  }
 }
 
 variable "tags" {
