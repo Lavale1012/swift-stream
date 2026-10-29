@@ -76,3 +76,8 @@ output "api_task_role_arn" {
   value       = aws_iam_role.api_task.arn
 }
 
+
+output "ecr_repository_urls" {
+  description = "Image repositories by service (worker, api). Push to <url>:<git sha>; log in first with: aws ecr get-login-password | docker login --username AWS --password-stdin <registry>"
+  value       = { for name, repo in module.ecr : name => repo.repository_url }
+}

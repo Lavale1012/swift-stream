@@ -40,7 +40,7 @@ variable "availability_zones" {
 variable "private_subnet_cidrs" {
   description = "CIDR blocks for the private subnets, one per availability zone, in the same order."
   type        = list(string)
-  default     = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  default     = ["10.0.1.0/24", "10.0.2.0/24"]
 
   validation {
     condition     = length(var.private_subnet_cidrs) == length(var.availability_zones)
@@ -51,7 +51,7 @@ variable "private_subnet_cidrs" {
 variable "public_subnet_cidrs" {
   description = "CIDR blocks for the public subnets, one per availability zone, in the same order."
   type        = list(string)
-  default     = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+  default     = ["10.0.101.0/24", "10.0.102.0/24"]
 
   validation {
     condition     = length(var.public_subnet_cidrs) == length(var.availability_zones)
@@ -161,6 +161,52 @@ variable "force_destroy_buckets" {
   description = "Let terraform destroy delete the S3 buckets even when they still hold objects, deleting the objects too. Keep this off outside dev."
   type        = bool
   default     = true
+}
+
+variable "force_delete_repositories" {
+  description = "Let terraform destroy delete the ECR repositories even when they still hold images, deleting the images too. Keep this off outside dev."
+  type        = bool
+  default     = true
+}
+
+variable "ecr_images_to_keep" {
+  description = "Tagged images each ECR repository keeps; older ones expire. Enough to roll back a few deploys."
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.ecr_images_to_keep >= 1 && floor(var.ecr_images_to_keep) == var.ecr_images_to_keep
+    error_message = "ecr_images_to_keep must be a whole number, at least 1."
+  }
+}
+
+variable "worker_image_tag" {
+  description = "Tag of the worker image in ECR to run, normally the git commit SHA it was built from. Empty until the first push."
+  type        = string
+  default     = ""
+}
+
+variable "worker_desired_count" {
+  description = "Worker tasks to run. Each one bills while it runs, busy or idle. Needs worker_image_tag."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.worker_desired_count == 0 || var.worker_image_tag != ""
+    error_message = "Set worker_image_tag to a pushed image before running worker tasks."
+  }
+}
+
+variable "worker_cpu" {
+  description = "CPU units per worker task (1024 = 1 vCPU). FFmpeg is CPU-bound, so this sets encoding speed."
+  type        = number
+  default     = 2048
+}
+
+variable "worker_memory" {
+  description = "Memory per worker task, in MiB. Fargate allows only certain CPU and memory pairs; 2048 CPU takes 4096 to 16384."
+  type        = number
+  default     = 4096
 }
 
 variable "monthly_budget_usd" {
