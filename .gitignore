@@ -69,3 +69,6 @@ __pycache__/
 *.tfvars
 !example.tfvars
 crash.log
+# Per-machine backend settings (the state bucket name), passed to
+# terraform init with -backend-config=backend.hcl.
+/infra/backend.hcl
