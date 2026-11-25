@@ -24,14 +24,20 @@ module "ecs" {
     # Long-polls the job queue and processes one video at a time (worker/).
     # Runs in the private subnets with no inbound traffic.
     worker = {
-      # 0 until an image is pushed and worker_image_tag is set. Queue-depth
-      # autoscaling replaces this once it is added.
-      desired_count = var.worker_desired_count
+      # The module ignores changes to desired_count after the service is
+      # created (it expects autoscaling to own the count), so the count is set
+      # through Application Auto Scaling instead: with the minimum and maximum
+      # equal and no policies, it holds the service at exactly
+      # worker_desired_count. Queue-depth scaling replaces this later by
+      # raising the maximum and adding policies.
+      desired_count            = var.worker_desired_count
+      enable_autoscaling       = true
+      autoscaling_min_capacity = var.worker_desired_count
+      autoscaling_max_capacity = var.worker_desired_count
 
-      # The module defaults to target tracking on CPU and memory with at
-      # least one task always running. CPU is the wrong signal for a queue
-      # worker, and an idle task bills around the clock.
-      enable_autoscaling = false
+      # The module's default policies track CPU and memory, the wrong signal
+      # for a queue worker.
+      autoscaling_policies = {}
 
       cpu    = var.worker_cpu
       memory = var.worker_memory
