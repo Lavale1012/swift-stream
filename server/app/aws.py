@@ -79,8 +79,12 @@ def connect() -> boto3.Session:
     variables, the ~/.aws files, or an attached IAM role), confirm they work
     by asking STS who we are, and return the session."""
     session = boto3.Session()
+    # boto3 reads the region from AWS_DEFAULT_REGION and ignores AWS_REGION,
+    # which the Go SDK (and so the worker) uses.
     if session.region_name is None:
-        raise RuntimeError("aws region not set: set AWS_REGION or a region in ~/.aws/config")
+        raise RuntimeError(
+            "aws region not set: set AWS_DEFAULT_REGION or a region in ~/.aws/config"
+        )
 
     identity = session.client("sts", config=Config(**TIMEOUTS)).get_caller_identity()
     logger.info("aws: authenticated as %s in %s", identity["Arn"], session.region_name)
