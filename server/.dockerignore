@@ -1,0 +1,7 @@
+# The image needs only pyproject.toml and app/. Everything else stays out of
+# the build context, so local files such as .venv or a stray .env cannot end
+# up in a layer.
+*
+!pyproject.toml
+!app/
+**/__pycache__
