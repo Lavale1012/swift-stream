@@ -1,0 +1,332 @@
+/* Layout: one left-aligned column. The steps hang off a rail on the left
+   that fills with the signal colour as the job moves through them. */
+
+.page {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+.masthead {
+  margin-bottom: clamp(2.5rem, 9vw, 4.5rem);
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.wordmark svg {
+  color: var(--signal);
+}
+
+h1 {
+  font-size: clamp(2.25rem, 7vw, 3.5rem);
+  font-weight: 800;
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+  max-width: 14ch;
+}
+
+.lede {
+  margin-top: 1rem;
+  max-width: 34rem;
+  font-size: 1.1875rem;
+  color: var(--muted);
+  text-wrap: pretty;
+}
+
+/* Steps */
+
+.steps {
+  list-style: none;
+  margin: 3rem 0 0;
+  padding: 0;
+}
+
+.step {
+  --marker: 2.25rem;
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--marker) minmax(0, 1fr);
+  column-gap: 1rem;
+  row-gap: 0.75rem;
+  padding-bottom: 2.25rem;
+}
+
+.step:last-child {
+  padding-bottom: 0;
+}
+
+/* The rail between this marker and the next: ::before is the track,
+   ::after the fill. */
+.step:not(:last-child)::before,
+.step:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  top: calc(var(--marker) + 4px);
+  bottom: 4px;
+  left: calc(var(--marker) / 2 - 1.5px);
+  width: 3px;
+  border-radius: 3px;
+}
+
+.step::before {
+  background: var(--line);
+}
+
+.step::after {
+  background: var(--signal);
+  transform-origin: top;
+  transform: scaleY(var(--fill, 0));
+  transition: transform 250ms ease-out;
+}
+
+.step[data-state="done"] {
+  --fill: 1;
+}
+
+/* No measurable progress while the worker runs, so a pulse travels down
+   the rail instead. */
+.step[data-busy]::after {
+  transform: none;
+  background: linear-gradient(to bottom, transparent, var(--signal) 50%, transparent) 0 100% / 100% 200% no-repeat;
+  animation: flow 1.4s linear infinite;
+}
+
+@keyframes flow {
+  to {
+    background-position: 0 0;
+  }
+}
+
+.step-marker {
+  grid-row: 1 / span 2;
+  display: grid;
+  place-items: center;
+  width: var(--marker);
+  height: var(--marker);
+  border: 2px solid var(--line);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--muted);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  transition:
+    background-color 200ms,
+    border-color 200ms,
+    color 200ms;
+}
+
+.step[data-state="active"] .step-marker {
+  border-color: var(--signal);
+  color: var(--signal);
+}
+
+.step[data-state="done"] .step-marker {
+  border-color: var(--signal);
+  background: var(--signal);
+  color: var(--signal-ink);
+}
+
+.step[data-state="error"] .step-marker {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: var(--paper);
+}
+
+.step-title {
+  align-self: center;
+  min-height: var(--marker);
+  display: flex;
+  align-items: center;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.step[data-state="todo"] .step-title {
+  color: var(--muted);
+}
+
+.step-body {
+  grid-column: 2;
+  display: grid;
+  gap: 0.75rem;
+  justify-items: start;
+}
+
+.note {
+  overflow-wrap: anywhere;
+}
+
+/* Upload */
+
+.dropzone {
+  justify-self: stretch;
+  display: grid;
+  gap: 0.25rem;
+  padding: 2rem 1.25rem;
+  border: 2px dashed var(--line);
+  border-radius: var(--radius-large);
+  background: var(--surface);
+  text-align: center;
+  cursor: pointer;
+  transition:
+    border-color 150ms,
+    background-color 150ms;
+}
+
+/* Keep drag events on the label, not its text. */
+.dropzone > * {
+  pointer-events: none;
+}
+
+.dropzone:hover,
+.dropzone[data-dragging] {
+  border-color: var(--signal);
+}
+
+.dropzone[data-dragging] {
+  background: var(--signal-soft);
+}
+
+.dropzone:has(input:focus-visible) {
+  outline: 3px solid var(--signal);
+  outline-offset: 3px;
+}
+
+.dropzone-title {
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--signal);
+}
+
+.dropzone-hint {
+  font-size: 0.9375rem;
+  color: var(--muted);
+}
+
+.upload {
+  justify-self: stretch;
+  display: grid;
+  gap: 0.625rem;
+  justify-items: start;
+}
+
+.file-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.bar {
+  justify-self: stretch;
+  height: 0.5rem;
+  border-radius: 0.5rem;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--signal);
+  transform-origin: left;
+  transition: transform 200ms linear;
+}
+
+.progress-text {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Problems */
+
+.problem {
+  justify-self: stretch;
+  display: grid;
+  gap: 0.875rem;
+  padding: 1rem 1.125rem;
+  border-left: 4px solid var(--danger);
+  border-radius: 0 var(--radius-small) var(--radius-small) 0;
+  background: var(--danger-soft);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.625rem;
+}
+
+.job-id {
+  font-size: 0.875rem;
+}
+
+/* Player */
+
+.player {
+  justify-self: stretch;
+  display: grid;
+  gap: 1rem;
+  justify-items: start;
+  padding: 1.25rem;
+  border-radius: var(--radius-large);
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.player audio {
+  width: 100%;
+}
+
+/* Buttons */
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+  padding: 0 1.125rem;
+  border: 2px solid var(--signal);
+  border-radius: var(--radius-small);
+  background: var(--signal);
+  color: var(--signal-ink);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: filter 150ms;
+}
+
+.button:hover {
+  filter: brightness(1.08);
+}
+
+.button-quiet {
+  border-color: var(--line);
+  background: transparent;
+  color: var(--ink);
+}
+
+.button-quiet:hover {
+  filter: none;
+  border-color: var(--ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+  }
+
+  .step[data-busy]::after {
+    animation: none;
+    background: var(--signal);
+    opacity: 0.4;
+  }
+}
